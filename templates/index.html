@@ -1,54 +1,220 @@
-<!doctype html>
+
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vidtool — Offline Video Reverse Engineering</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131c">
+  <title>Vidtool V2 — Offline Video Intelligence</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-<main class="shell">
-<header><div class="eyebrow">PRIVATE · LOCAL · OFFLINE</div><h1>Vidtool<span>.</span></h1>
-<p class="sub">Video structure analysis and recreation-prompt builder. No cloud AI. No API keys. No billing.</p></header>
-<section class="panel">
-<h2>Analyze a video</h2>
-<p class="muted">Supported: MP4, MOV, M4V, MKV, WEBM, AVI · Maximum {{ max_upload_mb }} MB · Maximum {{ max_duration }} seconds</p>
-<form method="post" action="/analyze" enctype="multipart/form-data">
-<label class="drop"><input type="file" name="video" accept="video/*" required><span>Choose a video from your device</span><small>Video is processed locally and deleted after analysis.</small></label>
-<button type="submit">Analyze video</button>
-</form>
-{% if error %}<div class="error">{{ error }}</div>{% endif %}
-</section>
-{% if report %}
-<section class="panel">
-<div class="result-head"><h2>Analysis report</h2><a class="download" href="/report/{{ report.job_id }}">Download JSON</a></div>
-<div class="stats">
-<div><small>DURATION</small><b>{{ report.metadata.duration_seconds }}s</b></div>
-<div><small>RESOLUTION</small><b>{{ report.metadata.width }}×{{ report.metadata.height }}</b></div>
-<div><small>SAMPLED FRAMES</small><b>{{ report.visual_summary.sampled_frames }}</b></div>
-<div><small>SCENES EST.</small><b>{{ report.scenes|length }}</b></div>
-</div>
-<h3>Visual measurements</h3>
-<p>{{ report.visual_summary.visual_change_label }} · Average brightness {{ report.visual_summary.average_brightness_0_255 }}/255 · Frame-change score {{ report.visual_summary.average_frame_change_percent }}%</p>
-<h3>Scene timeline</h3>
-<div class="timeline">
-{% for scene in report.scenes %}
-<article class="scene"><div class="time">{{ scene.start_seconds }}s — {{ scene.end_seconds }}s</div><b>Scene {{ scene.scene_number }}</b><p>{{ scene.description }}</p></article>
-{% endfor %}
-</div>
-<h3>Audio</h3>
-<p>{% if report.audio.present %}Audio detected. Mean volume: {{ report.audio.mean_volume_db if report.audio.mean_volume_db is not none else "unavailable" }} dB; peak: {{ report.audio.peak_volume_db if report.audio.peak_volume_db is not none else "unavailable" }} dB.{% else %}No audio stream detected.{% endif %}</p>
-<p class="muted">{{ report.audio.note }}</p>
-<h3>Recreation prompt</h3>
-<textarea id="prompt" readonly>{{ report.recreation_prompt }}</textarea>
-<div class="actions"><button type="button" class="secondary" onclick="copyPrompt()">Copy prompt</button><button type="button" class="secondary" onclick="copyJson()">Copy report JSON</button></div>
-<h3>Accuracy & limitations</h3><ul>{% for item in report.limitations %}<li>{{ item }}</li>{% endfor %}</ul>
-<script id="report-data" type="application/json">{{ report|tojson }}</script>
-</section>
-{% endif %}
-<footer>Vidtool v1.0 · Pure offline algorithms · No semantic AI claims</footer>
-</main>
-<script>
-function copyPrompt(){const t=document.getElementById('prompt');t.select();document.execCommand('copy');}
-function copyJson(){const d=JSON.parse(document.getElementById('report-data').textContent);navigator.clipboard?.writeText(JSON.stringify(d,null,2)).then(()=>alert('Report JSON copied.')).catch(()=>alert('Clipboard unavailable in this browser.'));}
-</script>
-</body></html>
+  <header class="topbar">
+    <a class="brand" href="/">VIDTOOL<span> V2</span></a>
+    <div class="offline"><i></i> LOCAL · OFFLINE</div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <p class="eyebrow">YOUR VIDEO ANALYSIS WORKSPACE</p>
+      <h1>Understand your video.<br><span>Measure every scene.</span></h1>
+      <p class="sub">
+        Offline video analysis powered by our own algorithms.
+        Your video is processed locally and is not sent to an AI service.
+      </p>
+    </section>
+
+    {% if error %}
+      <div class="alert">{{ error }}</div>
+    {% endif %}
+
+    <section class="panel upload-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">01 / INPUT</p>
+          <h2>Upload a video</h2>
+        </div>
+        <span class="tag">NO CLOUD AI</span>
+      </div>
+
+      <form action="/analyze" method="post" enctype="multipart/form-data">
+        <label class="dropzone" for="video">
+          <div class="upload-icon">↑</div>
+          <strong>Choose your video</strong>
+          <span>MP4 · MOV · MKV · WEBM · AVI</span>
+          <input id="video" name="video" type="file"
+                 accept="video/*" required>
+          <span id="file-name" class="file-name">No file selected</span>
+        </label>
+        <p class="hint">
+          Maximum {{ max_upload_mb }} MB · Maximum duration
+          {{ max_duration }} seconds
+        </p>
+        <button class="primary" type="submit">Analyze video <span>→</span></button>
+      </form>
+    </section>
+
+    {% if report %}
+      <section class="results">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">02 / ANALYSIS</p>
+            <h2>Analysis complete</h2>
+            <p class="hint">{{ report.filename }}</p>
+          </div>
+          <span class="tag success">PROCESSED LOCALLY</span>
+        </div>
+
+        <div class="metrics">
+          <article class="metric">
+            <span>Duration</span>
+            <strong>{{ report.metadata.duration }}s</strong>
+          </article>
+          <article class="metric">
+            <span>Resolution</span>
+            <strong>{{ report.metadata.width }} × {{ report.metadata.height }}</strong>
+          </article>
+          <article class="metric">
+            <span>Estimated scenes</span>
+            <strong>{{ report.summary.estimated_scenes }}</strong>
+          </article>
+          <article class="metric">
+            <span>Frames sampled</span>
+            <strong>{{ report.summary.sampled_frames }}</strong>
+          </article>
+        </div>
+
+        <section class="panel">
+          <p class="eyebrow">03 / VISUAL MEASUREMENTS</p>
+          <h2>Video characteristics</h2>
+          <div class="measure-grid">
+            <div>
+              <span>Average brightness</span>
+              <strong>{{ report.summary.average_brightness }} / 255</strong>
+            </div>
+            <div>
+              <span>Average frame change</span>
+              <strong>{{ report.summary.average_frame_change }}</strong>
+            </div>
+            <div>
+              <span>Codec</span>
+              <strong>{{ report.metadata.codec }}</strong>
+            </div>
+            <div>
+              <span>Frame rate metadata</span>
+              <strong>{{ report.metadata.fps }}</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <p class="eyebrow">04 / SCENE TIMELINE</p>
+          <h2>Detected scene changes</h2>
+          {% for scene in report.scenes %}
+            <article class="scene">
+              <div class="scene-top">
+                <strong>Scene {{ scene.scene }}</strong>
+                <span>{{ scene.start }}s — {{ scene.end }}s</span>
+              </div>
+              <div class="timeline">
+                <div style="width: {{ (scene.duration / report.metadata.duration * 100)|round(2) }}%"></div>
+              </div>
+              <div class="scene-details">
+                <span>Brightness: {{ scene.average_brightness }}</span>
+                <span>Contrast: {{ scene.average_contrast }}</span>
+                <span>Frame change: {{ scene.average_motion_change }}</span>
+              </div>
+              <p class="hint">
+                Average RGB:
+                {{ scene.average_rgb.red }},
+                {{ scene.average_rgb.green }},
+                {{ scene.average_rgb.blue }}
+                · Keyframe time: {{ scene.keyframe_time }}s
+              </p>
+            </article>
+          {% else %}
+            <p class="hint">No scene segments could be generated.</p>
+          {% endfor %}
+        </section>
+
+        <section class="panel">
+          <p class="eyebrow">05 / AUDIO</p>
+          <h2>Audio measurements</h2>
+          {% if report.audio.available %}
+            <div class="measure-grid">
+              <div>
+                <span>Mean loudness</span>
+                <strong>{{ report.audio.mean_volume_db if report.audio.mean_volume_db is not none else "Unavailable" }}</strong>
+              </div>
+              <div>
+                <span>Maximum loudness</span>
+                <strong>{{ report.audio.max_volume_db if report.audio.max_volume_db is not none else "Unavailable" }}</strong>
+              </div>
+              <div>
+                <span>Silence regions</span>
+                <strong>{{ report.audio.silence_regions|length }}</strong>
+              </div>
+            </div>
+            <p class="hint">{{ report.audio.note }}</p>
+          {% else %}
+            <p class="hint">{{ report.audio.reason }}</p>
+          {% endif %}
+        </section>
+
+        <section class="panel">
+          <p class="eyebrow">06 / PROMPT RECONSTRUCTION</p>
+          <h2>Evidence-based prompt</h2>
+          <textarea id="prompt" readonly>{{ report.prompt }}</textarea>
+          <div class="actions">
+            <button class="secondary" type="button" id="copy-prompt">Copy prompt</button>
+            <a class="secondary link-button" href="/report/{{ report_id }}">Download JSON report</a>
+            <a class="secondary link-button" href="data:text/plain;charset=utf-8,{{ report.prompt|urlencode }}" download="vidtool-prompt.txt">Download TXT prompt</a>
+          </div>
+          <p id="copy-status" class="hint" aria-live="polite"></p>
+        </section>
+
+        <section class="panel note-panel">
+          <h2>Analysis limitations</h2>
+          <ul>
+            {% for item in report.limitations %}
+              <li>{{ item }}</li>
+            {% endfor %}
+          </ul>
+        </section>
+      </section>
+    {% endif %}
+
+    <footer>
+      VIDTOOL V2 · OFFLINE VIDEO ANALYSIS · NO CLOUD AI
+    </footer>
+  </main>
+
+  <script>
+    const input = document.getElementById("video");
+    const fileName = document.getElementById("file-name");
+
+    if (input) {
+      input.addEventListener("change", () => {
+        fileName.textContent = input.files.length
+          ? input.files[0].name
+          : "No file selected";
+      });
+    }
+
+    const copyButton = document.getElementById("copy-prompt");
+    if (copyButton) {
+      copyButton.addEventListener("click", async () => {
+        const prompt = document.getElementById("prompt");
+        const status = document.getElementById("copy-status");
+        try {
+          await navigator.clipboard.writeText(prompt.value);
+          status.textContent = "Prompt copied.";
+        } catch {
+          prompt.select();
+          status.textContent = "Select and copy the prompt manually.";
+        }
+      });
+    }
+  </script>
+</body>
+</html>
