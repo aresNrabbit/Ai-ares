@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -7,246 +8,371 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from PIL import Image, ImageStat, ImageChops
+
+from PIL import Image, ImageFilter, ImageStat
 
 
 class AnalysisError(Exception):
     pass
 
 
-def _tool(name: str) -> str:
-    path = shutil.which(name)
-    if not path:
-        raise AnalysisError(f"{name} was not found. Install FFmpeg in Termux with: pkg install ffmpeg")
-    return path
-
-
-def _run(args, timeout=120):
+def run_command(args, timeout=180):
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        raise AnalysisError("Media processing timed out. Try a shorter or smaller video.")
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "Unknown FFmpeg error").strip()
-        raise AnalysisError(detail[-1200:])
-    return proc.stdout
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+    except FileNotFoundError as exc:
+        raise AnalysisError(
+            "FFmpeg and FFprobe must be installed in Termux."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AnalysisError("Video analysis timed out.") from exc
+
+    if result.returncode != 0:
+        message = (result.stderr or "Unknown FFmpeg error")[-1200:]
+        raise AnalysisError(message)
+
+    return result
 
 
-def _probe(path: Path):
-    raw = _run([_tool("ffprobe"), "-v", "error", "-show_streams", "-show_format",
-                "-of", "json", str(path)], timeout=45)
+def get_metadata(video_path):
+    result = run_command([
+        "ffprobe", "-v", "error",
+        "-show_entries",
+        "format=duration,size,format_name:"
+        "stream=codec_type,codec_name,width,height,r_frame_rate",
+        "-of", "json", str(video_path)
+    ])
+
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        raise AnalysisError("Could not read the video's metadata. The file may be damaged.")
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AnalysisError("Could not read video metadata.") from exc
+
     streams = data.get("streams", [])
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    video = next(
+        (s for s in streams if s.get("codec_type") == "video"),
+        None
+    )
+
     if not video:
-        raise AnalysisError("No video stream was found in this file.")
-    fmt = data.get("format", {})
-    duration = float(fmt.get("duration") or video.get("duration") or 0)
-    if duration <= 0:
-        raise AnalysisError("Video duration could not be determined.")
-    return {
-        "duration_seconds": round(duration, 2),
-        "width": int(video.get("width") or 0),
-        "height": int(video.get("height") or 0),
-        "fps": _parse_fps(video.get("avg_frame_rate") or video.get("r_frame_rate")),
-        "video_codec": video.get("codec_name", "unknown"),
-        "audio_present": audio is not None,
-        "audio_codec": audio.get("codec_name", "none") if audio else "none",
-        "format": fmt.get("format_name", "unknown"),
-        "size_bytes": int(fmt.get("size") or path.stat().st_size),
-    }
+        raise AnalysisError("No video stream was found.")
 
-
-def _parse_fps(value):
     try:
-        a, b = value.split("/")
-        return round(float(a) / float(b), 3) if float(b) else None
-    except Exception:
-        try:
-            return round(float(value), 3)
-        except Exception:
-            return None
+        duration = float(data.get("format", {}).get("duration", 0))
+    except (TypeError, ValueError):
+        duration = 0
 
+    if duration <= 0:
+        raise AnalysisError("The video duration could not be determined.")
 
-def _frame_metrics(path: Path):
-    with Image.open(path) as source:
-        im = source.convert("RGB")
-        im.thumbnail((160, 160))
-        stat = ImageStat.Stat(im)
-        means = [round(v, 1) for v in stat.mean]
-        brightness = round(sum(means) / 3, 1)
-        gray = im.convert("L")
-        hist = gray.histogram()
-        total = sum(hist) or 1
-        entropy = -sum((n / total) * math.log2(n / total) for n in hist if n)
-        # A lightweight edge proxy from neighboring pixel differences.
-        small = gray.resize((80, 80))
-        px = small.load()
-        w, h = small.size
-        edge_sum = 0
-        count = 0
-        for y in range(h - 1):
-            for x in range(w - 1):
-                edge_sum += abs(px[x, y] - px[x + 1, y]) + abs(px[x, y] - px[x, y + 1])
-                count += 2
-        edge_density = round(edge_sum / max(count, 1), 2)
-        return {"mean_rgb": means, "brightness": brightness,
-                "contrast_proxy": round(stat.stddev[0] if len(stat.stddev) else 0, 1),
-                "gray_entropy": round(entropy, 2), "edge_density": edge_density,
-                "width": im.width, "height": im.height}, gray
-
-
-def _difference(a, b):
-    a = a.resize((80, 80))
-    b = b.resize((80, 80))
-    diff = ImageChops.difference(a, b)
-    stat = ImageStat.Stat(diff)
-    return round(sum(stat.mean) / 255 * 100, 2)
-
-
-def _audio_summary(path: Path, audio_present: bool):
-    if not audio_present:
-        return {"present": False, "note": "No audio stream detected."}
-    # FFmpeg's built-in volume detector: no external speech service or API.
-    result = subprocess.run([_tool("ffmpeg"), "-hide_banner", "-i", str(path),
-                             "-vn", "-af", "volumedetect", "-f", "null", "-"],
-                            capture_output=True, text=True, timeout=120)
-    text = result.stderr or ""
-    mean = re.search(r" mean_volume:\s*(-?[\d.]+) dB", text)
-    peak = re.search(r" max_volume:\s*(-?[\d.]+) dB", text)
     return {
-        "present": True,
-        "mean_volume_db": float(mean.group(1)) if mean else None,
-        "peak_volume_db": float(peak.group(1)) if peak else None,
-        "note": "Volume statistics only. This offline build does not transcribe speech or identify sound sources."
+        "duration": round(duration, 2),
+        "width": int(video.get("width", 0)),
+        "height": int(video.get("height", 0)),
+        "codec": video.get("codec_name", "unknown"),
+        "format": data.get("format", {}).get("format_name", "unknown"),
+        "fps": video.get("r_frame_rate", "unknown"),
+        "size_mb": round(
+            int(data.get("format", {}).get("size", 0)) / 1048576, 2
+        ),
+        "has_audio": any(
+            s.get("codec_type") == "audio" for s in streams
+        )
     }
 
 
-def analyze_video(path: Path, max_duration=900):
-    meta = _probe(path)
-    if meta["duration_seconds"] > max_duration:
-        raise AnalysisError(f"Video is {meta['duration_seconds']} seconds. Current limit is {max_duration} seconds.")
-    if meta["width"] <= 0 or meta["height"] <= 0:
-        raise AnalysisError("Video dimensions are invalid.")
+def frame_features(path):
+    with Image.open(path) as original:
+        image = original.convert("RGB")
+        image.thumbnail((96, 96))
 
-    # Aim for roughly one sample every 2 seconds, capped to keep mobile memory use modest.
-    interval = 2.0
-    sample_count = max(1, min(120, int(meta["duration_seconds"] / interval) + 1))
-    with tempfile.TemporaryDirectory(prefix="vidtool-") as temp:
-        pattern = str(Path(temp) / "frame_%04d.jpg")
-        _run([_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", str(path),
-              "-vf", f"fps=1/2,scale=480:-2", "-frames:v", "120",
-              "-q:v", "4", pattern], timeout=180)
-        frame_paths = sorted(Path(temp).glob("frame_*.jpg"))
-        if not frame_paths:
-            raise AnalysisError("FFmpeg could not extract any frames from this video.")
+        gray = image.convert("L")
+        stat = ImageStat.Stat(image)
+        gray_stat = ImageStat.Stat(gray)
 
-        frames = []
-        previous_gray = None
-        for idx, frame_path in enumerate(frame_paths):
-            metrics, gray = _frame_metrics(frame_path)
-            timestamp = round(idx * interval, 2)
-            change = _difference(previous_gray, gray) if previous_gray is not None else 0.0
-            metrics["timestamp_seconds"] = timestamp
-            metrics["change_from_previous_percent"] = change
-            frames.append(metrics)
-            previous_gray = gray
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edge_mean = ImageStat.Stat(edges).mean[0]
 
-    # Scene boundaries are heuristics based on large frame-to-frame visual changes.
-    boundaries = [0]
-    for i in range(1, len(frames)):
-        if frames[i]["change_from_previous_percent"] >= 18:
-            boundaries.append(i)
-    boundaries.append(len(frames))
-    scenes = []
-    for n in range(len(boundaries) - 1):
-        start_i, end_i = boundaries[n], boundaries[n + 1]
-        if end_i <= start_i:
-            continue
-        subset = frames[start_i:end_i]
-        start = subset[0]["timestamp_seconds"]
-        end = (frames[end_i]["timestamp_seconds"] if end_i < len(frames)
-               else meta["duration_seconds"])
-        avg_brightness = round(sum(f["brightness"] for f in subset) / len(subset), 1)
-        avg_change = round(sum(f["change_from_previous_percent"] for f in subset) / len(subset), 2)
-        scenes.append({
-            "scene_number": len(scenes) + 1,
-            "start_seconds": start,
-            "end_seconds": round(max(start, end), 2),
-            "sampled_frames": len(subset),
-            "average_brightness": avg_brightness,
-            "visual_change_score": avg_change,
-            "description": _scene_text(avg_brightness, avg_change, len(subset))
+        histogram = gray.histogram()
+        total = max(1, sum(histogram))
+        bins = []
+        for i in range(16):
+            start = i * 16
+            bins.append(sum(histogram[start:start + 16]) / total)
+
+        return {
+            "brightness": round(gray_stat.mean[0], 2),
+            "contrast": round(gray_stat.stddev[0], 2),
+            "red": round(stat.mean[0], 2),
+            "green": round(stat.mean[1], 2),
+            "blue": round(stat.mean[2], 2),
+            "edge_strength": round(edge_mean, 2),
+            "histogram": bins,
+            "gray": gray.resize((48, 48))
+        }
+
+
+def histogram_distance(a, b):
+    return sum(abs(x - y) for x, y in zip(a, b)) / 2
+
+
+def image_difference(a, b):
+    difference = ImageStat.Stat(
+        Image.eval_pair(a, b, lambda x, y: abs(x - y))
+    ).mean[0]
+    return round(difference, 2)
+
+
+def analyze_audio(video_path):
+    if not shutil.which("ffmpeg"):
+        return {"available": False, "reason": "FFmpeg unavailable"}
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(video_path),
+            "-vn",
+            "-af",
+            "silencedetect=noise=-35dB:d=0.5,volumedetect",
+            "-f", "null", "-"
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False
+    )
+
+    log = result.stderr or ""
+
+    mean_match = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", log)
+    max_match = re.search(r"max_volume:\s*(-?[\d.]+)\s*dB", log)
+
+    silences = []
+    starts = re.findall(r"silence_start:\s*([\d.]+)", log)
+    ends = re.findall(r"silence_end:\s*([\d.]+)", log)
+
+    for index, start in enumerate(starts):
+        end = float(ends[index]) if index < len(ends) else None
+        silences.append({
+            "start": round(float(start), 2),
+            "end": round(end, 2) if end is not None else None
         })
 
-    avg_brightness = round(sum(f["brightness"] for f in frames) / len(frames), 1)
-    avg_edge = round(sum(f["edge_density"] for f in frames) / len(frames), 2)
-    motion_values = [f["change_from_previous_percent"] for f in frames[1:]]
-    avg_change = round(sum(motion_values) / len(motion_values), 2) if motion_values else 0
-    motion_label = ("low sampled visual change" if avg_change < 4 else
-                    "moderate sampled visual change" if avg_change < 10 else
-                    "high sampled visual change")
-    audio = _audio_summary(path, meta["audio_present"])
-    report = {
-        "app": "Vidtool",
-        "version": "1.0.0-pure-offline",
-        "analysis_mode": "Pure offline algorithms; no AI API and no pretrained model",
-        "metadata": meta,
-        "visual_summary": {
-            "sampled_frames": len(frames),
-            "average_brightness_0_255": avg_brightness,
-            "average_edge_density_proxy": avg_edge,
-            "average_frame_change_percent": avg_change,
-            "visual_change_label": motion_label,
-            "color_note": "Average RGB values are measurements of sampled frames, not semantic color descriptions."
-        },
-        "frames": frames,
-        "scenes": scenes,
-        "audio": audio,
-        "limitations": [
-            "This build does not recognize people, animals, objects, actions, locations or emotions.",
-            "Scene boundaries are estimates from sampled-frame differences; subtle cuts may be missed.",
-            "Frame-to-frame change is not the same as camera motion: moving subjects and edits can also cause change.",
-            "Audio analysis reports volume only; it does not transcribe speech or identify music/sound effects."
-        ]
+    return {
+        "available": True,
+        "mean_volume_db": float(mean_match.group(1)) if mean_match else None,
+        "max_volume_db": float(max_match.group(1)) if max_match else None,
+        "silence_regions": silences,
+        "note": "Loudness and silence estimates only; no speech recognition."
     }
-    report["recreation_prompt"] = build_prompt(report)
-    return report
 
 
-def _scene_text(brightness, change, samples):
-    light = "bright" if brightness >= 175 else "mid-lit" if brightness >= 85 else "dark"
-    activity = "visually stable" if change < 4 else "visually changing" if change < 10 else "visually dynamic"
-    return (f"Estimated {light} segment; {activity} across {samples} sampled frames. "
-            "Subject matter and exact actions were not semantically identified.")
+def analyze_video(video_path, max_duration=900):
+    video_path = Path(video_path)
+
+    if not video_path.exists():
+        raise AnalysisError("Video file not found.")
+
+    metadata = get_metadata(video_path)
+
+    if metadata["duration"] > max_duration:
+        raise AnalysisError(
+            f"Video is {metadata['duration']} seconds. "
+            f"Maximum allowed is {max_duration} seconds."
+        )
+
+    if metadata["width"] <= 0 or metadata["height"] <= 0:
+        raise AnalysisError("Invalid video dimensions.")
+
+    # Sample about one frame every two seconds.
+    interval = max(1.0, metadata["duration"] / 150.0)
+    interval = max(1.0, min(3.0, interval))
+    sample_limit = min(180, math.ceil(metadata["duration"] / interval) + 1)
+
+    with tempfile.TemporaryDirectory(prefix="vidtool_") as temp:
+        temp_dir = Path(temp)
+        pattern = temp_dir / "frame_%05d.jpg"
+
+        run_command([
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_path),
+            "-vf", f"fps=1/{interval:.3f},scale=480:-2",
+            "-frames:v", str(sample_limit),
+            "-q:v", "4",
+            str(pattern)
+        ], timeout=240)
+
+        frame_paths = sorted(temp_dir.glob("frame_*.jpg"))
+
+        if not frame_paths:
+            raise AnalysisError("FFmpeg could not extract video frames.")
+
+        frames = []
+        previous = None
+
+        for index, path in enumerate(frame_paths):
+            feature = frame_features(path)
+            timestamp = min(
+                round(index * interval, 2),
+                metadata["duration"]
+            )
+
+            motion = 0.0
+            scene_change = 0.0
+
+            if previous is not None:
+                motion = image_difference(
+                    previous["gray"], feature["gray"]
+                )
+                scene_change = histogram_distance(
+                    previous["histogram"], feature["histogram"]
+                )
+
+            feature.pop("gray")
+            feature["timestamp"] = timestamp
+            feature["motion_change"] = motion
+            feature["scene_change_score"] = round(scene_change, 4)
+            frames.append(feature)
+
+            previous = {
+                "gray": Image.open(path).convert("L").resize((48, 48)),
+                "histogram": feature["histogram"]
+            }
+
+        # Scene boundaries are estimates based on histogram changes.
+        cuts = []
+        for frame in frames[1:]:
+            if frame["scene_change_score"] >= 0.38:
+                cuts.append(frame["timestamp"])
+
+        boundaries = [0.0] + cuts + [metadata["duration"]]
+        scenes = []
+
+        for index in range(len(boundaries) - 1):
+            start = boundaries[index]
+            end = boundaries[index + 1]
+            members = [
+                f for f in frames
+                if start <= f["timestamp"] < end
+            ]
+
+            if not members:
+                continue
+
+            scenes.append({
+                "scene": len(scenes) + 1,
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "duration": round(end - start, 2),
+                "keyframe_time": members[len(members) // 2]["timestamp"],
+                "average_brightness": round(
+                    sum(f["brightness"] for f in members) / len(members), 2
+                ),
+                "average_contrast": round(
+                    sum(f["contrast"] for f in members) / len(members), 2
+                ),
+                "average_motion_change": round(
+                    sum(f["motion_change"] for f in members) / len(members), 2
+                ),
+                "average_rgb": {
+                    channel: round(
+                        sum(f[channel] for f in members) / len(members), 1
+                    )
+                    for channel in ("red", "green", "blue")
+                }
+            })
+
+        average_motion = round(
+            sum(f["motion_change"] for f in frames) / max(1, len(frames)), 2
+        )
+
+        average_brightness = round(
+            sum(f["brightness"] for f in frames) / len(frames), 2
+        )
+
+        audio = (
+            analyze_audio(video_path)
+            if metadata["has_audio"]
+            else {"available": False, "reason": "No audio stream"}
+        )
+
+        report = {
+            "app": "Vidtool",
+            "version": "2.0",
+            "analysis_type": "pure_offline_algorithms",
+            "metadata": metadata,
+            "summary": {
+                "sampled_frames": len(frames),
+                "estimated_scenes": len(scenes),
+                "average_brightness": average_brightness,
+                "average_frame_change": average_motion,
+                "sampling_interval_seconds": round(interval, 2)
+            },
+            "scenes": scenes,
+            "frames": frames,
+            "audio": audio,
+            "limitations": [
+                "Scene boundaries are estimates from sampled-frame changes.",
+                "Frame changes do not prove camera movement.",
+                "No object, person, action, location or emotion recognition.",
+                "Audio analysis measures loudness and silence, not speech meaning."
+            ]
+        }
+
+        report["prompt"] = build_prompt(report)
+        return report
 
 
 def build_prompt(report):
-    m = report["metadata"]
-    v = report["visual_summary"]
+    meta = report["metadata"]
     lines = [
-        "Recreate the supplied reference video as closely as possible using the following measured structural characteristics.",
-        f"Format: {m['width']}x{m['height']} pixels, approximately {m['fps'] or 'unknown'} fps, "
-        f"duration {m['duration_seconds']} seconds.",
-        f"Overall sampled visual behavior: {v['visual_change_label']} "
-        f"(mean sampled-frame difference {v['average_frame_change_percent']}%).",
-        f"Average sampled brightness: {v['average_brightness_0_255']}/255. "
-        "Preserve the reference's overall exposure and contrast rather than inventing a new look.",
-        "Maintain the original chronological order, pacing, aspect ratio and approximate scene durations."
+        "VIDEO RECREATION PROMPT — EVIDENCE-BASED",
+        "",
+        f"Video duration: {meta['duration']} seconds.",
+        f"Frame dimensions: {meta['width']}x{meta['height']}.",
+        f"Frame rate metadata: {meta['fps']}.",
+        f"Video codec: {meta['codec']}.",
+        f"Estimated scene count: {len(report['scenes'])}.",
+        "",
+        "SCENE STRUCTURE:"
     ]
-    for s in report["scenes"]:
+
+    for scene in report["scenes"]:
+        rgb = scene["average_rgb"]
         lines.append(
-            f"At {s['start_seconds']}s–{s['end_seconds']}s: {s['description']} "
-            "Match the observed visual transition and timing."
+            f"Scene {scene['scene']} ({scene['start']}s–{scene['end']}s): "
+            f"brightness {scene['average_brightness']}/255, "
+            f"contrast {scene['average_contrast']}, "
+            f"frame-change level {scene['average_motion_change']}, "
+            f"average RGB ({rgb['red']}, {rgb['green']}, {rgb['blue']})."
         )
-    if report["audio"]["present"]:
-        lines.append("Retain an audio track with a comparable overall loudness profile; exact speech and sound sources were not identified.")
+
+    audio = report["audio"]
+    lines.extend(["", "AUDIO:"])
+
+    if audio.get("available"):
+        lines.append(
+            f"Mean loudness: {audio.get('mean_volume_db')} dB; "
+            f"maximum loudness: {audio.get('max_volume_db')} dB."
+        )
+        lines.append(
+            f"Detected silence regions: {len(audio.get('silence_regions', []))}."
+        )
     else:
-        lines.append("The reference contains no detected audio stream; keep the recreation silent unless intentionally changed.")
-    lines.append("Do not add objects, people, actions, locations, dialogue or camera movements that are not supported by the reference.")
-    lines.append("Note: this prompt is based on offline visual measurements, not semantic scene recognition.")
+        lines.append(audio.get("reason", "Audio not analyzed."))
+
+    lines.extend([
+        "",
+        "RECREATION GUIDANCE:",
+        "Use the measured scene timing, visual brightness, contrast, "
+        "colour balance and changes in the source video.",
+        "Do not assume objects, people, actions, locations, dialogue, "
+        "or camera movements that have not been independently identified.",
+        "This report contains technical measurements, not semantic scene understanding."
+    ])
+
     return "\n".join(lines)
