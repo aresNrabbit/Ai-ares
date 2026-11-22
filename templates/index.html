@@ -1,1 +1,54 @@
-
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vidtool — Offline Video Reverse Engineering</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="shell">
+<header><div class="eyebrow">PRIVATE · LOCAL · OFFLINE</div><h1>Vidtool<span>.</span></h1>
+<p class="sub">Video structure analysis and recreation-prompt builder. No cloud AI. No API keys. No billing.</p></header>
+<section class="panel">
+<h2>Analyze a video</h2>
+<p class="muted">Supported: MP4, MOV, M4V, MKV, WEBM, AVI · Maximum {{ max_upload_mb }} MB · Maximum {{ max_duration }} seconds</p>
+<form method="post" action="/analyze" enctype="multipart/form-data">
+<label class="drop"><input type="file" name="video" accept="video/*" required><span>Choose a video from your device</span><small>Video is processed locally and deleted after analysis.</small></label>
+<button type="submit">Analyze video</button>
+</form>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+</section>
+{% if report %}
+<section class="panel">
+<div class="result-head"><h2>Analysis report</h2><a class="download" href="/report/{{ report.job_id }}">Download JSON</a></div>
+<div class="stats">
+<div><small>DURATION</small><b>{{ report.metadata.duration_seconds }}s</b></div>
+<div><small>RESOLUTION</small><b>{{ report.metadata.width }}×{{ report.metadata.height }}</b></div>
+<div><small>SAMPLED FRAMES</small><b>{{ report.visual_summary.sampled_frames }}</b></div>
+<div><small>SCENES EST.</small><b>{{ report.scenes|length }}</b></div>
+</div>
+<h3>Visual measurements</h3>
+<p>{{ report.visual_summary.visual_change_label }} · Average brightness {{ report.visual_summary.average_brightness_0_255 }}/255 · Frame-change score {{ report.visual_summary.average_frame_change_percent }}%</p>
+<h3>Scene timeline</h3>
+<div class="timeline">
+{% for scene in report.scenes %}
+<article class="scene"><div class="time">{{ scene.start_seconds }}s — {{ scene.end_seconds }}s</div><b>Scene {{ scene.scene_number }}</b><p>{{ scene.description }}</p></article>
+{% endfor %}
+</div>
+<h3>Audio</h3>
+<p>{% if report.audio.present %}Audio detected. Mean volume: {{ report.audio.mean_volume_db if report.audio.mean_volume_db is not none else "unavailable" }} dB; peak: {{ report.audio.peak_volume_db if report.audio.peak_volume_db is not none else "unavailable" }} dB.{% else %}No audio stream detected.{% endif %}</p>
+<p class="muted">{{ report.audio.note }}</p>
+<h3>Recreation prompt</h3>
+<textarea id="prompt" readonly>{{ report.recreation_prompt }}</textarea>
+<div class="actions"><button type="button" class="secondary" onclick="copyPrompt()">Copy prompt</button><button type="button" class="secondary" onclick="copyJson()">Copy report JSON</button></div>
+<h3>Accuracy & limitations</h3><ul>{% for item in report.limitations %}<li>{{ item }}</li>{% endfor %}</ul>
+<script id="report-data" type="application/json">{{ report|tojson }}</script>
+</section>
+{% endif %}
+<footer>Vidtool v1.0 · Pure offline algorithms · No semantic AI claims</footer>
+</main>
+<script>
+function copyPrompt(){const t=document.getElementById('prompt');t.select();document.execCommand('copy');}
+function copyJson(){const d=JSON.parse(document.getElementById('report-data').textContent);navigator.clipboard?.writeText(JSON.stringify(d,null,2)).then(()=>alert('Report JSON copied.')).catch(()=>alert('Clipboard unavailable in this browser.'));}
+</script>
+</body></html>
